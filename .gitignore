@@ -1,0 +1,33 @@
+# 凭证文件（包含登录信息，绝对不能提交）
+bili_credential.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 采集数据（可选提交）
+*.json
+!requirements.txt
+
+# 但保留示例
+!example_output.json
