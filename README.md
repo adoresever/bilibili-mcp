@@ -21,7 +21,7 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/你的用户名/bilibili-mcp.git
+git clone https://github.com/adoresever/bilibili-mcp.git
 cd bilibili-mcp
 ```
 
