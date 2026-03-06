@@ -4,7 +4,11 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 
 支持 OpenClaw / Claude Code / Cursor / Cline 等所有 MCP 客户端。
 
+**24 个工具**，覆盖搜索采集、内容发布、数据分析、互动运营。
+
 ## 功能
+
+### 数据采集
 
 | Tool | 功能 | 说明 |
 |------|------|------|
@@ -15,6 +19,38 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 | `bili_video_info` | 视频详情 | 获取播放量、评论数、收藏数等 |
 | `bili_reply` | 回复评论 | 发表评论或回复评论（支持楼中楼） |
 | `bili_crawl` | 批量采集 | 搜索+评论+字幕一步到位 |
+
+### 内容发布
+
+| Tool | 功能 | 说明 |
+|------|------|------|
+| `bili_send_dynamic` | 发图文动态 | 发布文字/图文动态，支持定时发布、话题关联 |
+| `bili_upload_video` | 上传视频 | 单P视频上传，支持封面、标签、分区选择 |
+| `bili_upload_video_multi` | 多P上传 | 多分P视频合并投稿 |
+| `bili_send_opus` | 图文专栏 | 发布图文长内容（Opus） |
+| `bili_video_zones` | 分区查询 | 获取常用分区ID，辅助视频上传 |
+
+### 数据分析
+
+| Tool | 功能 | 说明 |
+|------|------|------|
+| `bili_hot_videos` | 热门视频 | 获取当前B站热门视频列表 |
+| `bili_hot_buzzwords` | 热搜关键词 | 获取B站热搜词/热门话题 |
+| `bili_weekly_hot` | 每周必看 | 获取每周必看推荐视频 |
+| `bili_rank` | 排行榜 | 全站及17个分区排行榜 |
+| `bili_user_info` | 用户信息 | 获取UP主粉丝数、等级、总播放量等 |
+| `bili_user_videos` | 用户视频 | 获取UP主投稿列表，支持排序和搜索 |
+
+### 互动运营
+
+| Tool | 功能 | 说明 |
+|------|------|------|
+| `bili_favorite_lists` | 收藏夹列表 | 获取自己或他人的收藏夹 |
+| `bili_favorite_content` | 收藏夹内容 | 获取收藏夹内视频，支持搜索 |
+| `bili_send_message` | 发私信 | 给指定用户发送文字私信 |
+| `bili_unread_messages` | 未读消息 | 获取私信、@、回复、点赞等未读数 |
+| `bili_received_replies` | 收到的回复 | 获取评论回复通知 |
+| `bili_received_at_and_likes` | @和点赞 | 获取@提及和点赞通知 |
 
 ## 快速开始
 
@@ -30,6 +66,8 @@ cd bilibili-mcp
 ```bash
 pip install -r requirements.txt
 ```
+
+需要 Python 3.10+，视频上传自动截取封面需要 ffmpeg。
 
 ### 3. 扫码登录
 
@@ -93,6 +131,13 @@ npx mcporter config add bilibili-mcp "python /path/to/bilibili-mcp/mcp_server.py
 - "获取视频字幕，总结视频内容"
 - "帮我回复这条评论"
 - "批量采集OpenClaw相关视频的评论和字幕"
+- "帮我发一条B站动态，配上这几张图片"
+- "把这个视频上传到B站科技区"
+- "看看B站现在什么最火"
+- "获取科技区排行榜前10的视频"
+- "分析这个UP主的粉丝和投稿数据"
+- "我有多少未读私信和回复？"
+- "看看我的收藏夹里有什么"
 
 ## 技术栈
 
@@ -104,7 +149,7 @@ npx mcporter config add bilibili-mcp "python /path/to/bilibili-mcp/mcp_server.py
 
 ```
 bilibili-mcp/
-├── mcp_server.py          # MCP Server 主文件（7个tool）
+├── mcp_server.py          # MCP Server 主文件（24个tool）
 ├── bili_login.py           # 扫码登录脚本
 ├── bili_credential.json    # 登录凭证（自动生成，勿提交）
 ├── requirements.txt        # Python 依赖
@@ -117,7 +162,8 @@ bilibili-mcp/
 
 - 首次使用需扫码登录，凭证保存在本地，不会上传
 - 请求间隔自动控制，避免频率过快
-- 回复评论功能请谨慎使用，遵守B站社区规则
+- 回复评论/发私信功能请谨慎使用，遵守B站社区规则
+- 视频上传未指定封面时，自动从视频第3秒截取（需要ffmpeg）
 - 本项目仅用于学习和研究
 
 ## License
