@@ -4,9 +4,17 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 
 支持 OpenClaw / Claude Code / Cursor / Cline 等所有 MCP 客户端。
 
-**24 个工具**，覆盖搜索采集、内容发布、数据分析、互动运营。
+**27 个工具**，覆盖登录认证、搜索采集、内容发布、数据分析、互动运营。
 
 ## 功能
+
+### 登录认证
+
+| Tool | 功能 | 说明 |
+|------|------|------|
+| `bili_login` | 扫码登录 | 生成二维码（base64图片），AI直接展示给用户扫码 |
+| `bili_login_check` | 登录状态检查 | 轮询扫码状态，扫码成功后自动保存凭证 |
+| `bili_check_credential` | 凭证验证 | 检查当前登录是否有效，返回用户名等信息 |
 
 ### 数据采集
 
@@ -69,26 +77,22 @@ pip install -r requirements.txt
 
 需要 Python 3.10+，视频上传自动截取封面需要 ffmpeg。
 
-### 3. 扫码登录
+### 3. 登录
+
+**方式一：通过 AI 工具登录（推荐）**
+
+接入 MCP 后，直接对 AI 说"登录B站"，AI 会调用 `bili_login` 生成二维码展示给你扫码，全程无需终端操作。
+
+**方式二：命令行登录**
 
 ```bash
 python bili_login.py
 ```
 
-终端会显示二维码，用B站App扫码确认，凭证自动保存到 `bili_credential.json`。
-
 ### 4. 测试运行
 
 ```bash
-# 用 MCP Inspector 测试
 npx @modelcontextprotocol/inspector python mcp_server.py
-
-# 或直接 Python 测试
-python -c "
-import asyncio
-from mcp_server import bili_search
-print(asyncio.run(bili_search('AI Agent', num=3)))
-"
 ```
 
 ## 接入 AI 工具
@@ -96,7 +100,6 @@ print(asyncio.run(bili_search('AI Agent', num=3)))
 ### OpenClaw
 
 ```bash
-# 通过 MCPorter 接入
 npm i -g mcporter
 npx mcporter config add bilibili-mcp "python /path/to/bilibili-mcp/mcp_server.py"
 ```
@@ -126,6 +129,7 @@ npx mcporter config add bilibili-mcp "python /path/to/bilibili-mcp/mcp_server.py
 
 接入后，你可以直接用自然语言让 AI 操作：
 
+- "登录B站"（AI会展示二维码给你扫）
 - "搜索B站上关于AI Agent的热门视频"
 - "获取这个视频的评论，分析用户需求"
 - "获取视频字幕，总结视频内容"
@@ -149,8 +153,8 @@ npx mcporter config add bilibili-mcp "python /path/to/bilibili-mcp/mcp_server.py
 
 ```
 bilibili-mcp/
-├── mcp_server.py          # MCP Server 主文件（24个tool）
-├── bili_login.py           # 扫码登录脚本
+├── mcp_server.py          # MCP Server 主文件（27个tool）
+├── bili_login.py           # 命令行扫码登录（备用）
 ├── bili_credential.json    # 登录凭证（自动生成，勿提交）
 ├── requirements.txt        # Python 依赖
 ├── README.md               # 项目说明
@@ -160,7 +164,8 @@ bilibili-mcp/
 
 ## 注意事项
 
-- 首次使用需扫码登录，凭证保存在本地，不会上传
+- 首次使用通过 AI 对话即可完成登录，无需终端操作
+- 凭证保存在本地，不会上传
 - 请求间隔自动控制，避免频率过快
 - 回复评论/发私信功能请谨慎使用，遵守B站社区规则
 - 视频上传未指定封面时，自动从视频第3秒截取（需要ffmpeg）

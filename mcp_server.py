@@ -44,12 +44,184 @@ def load_credential() -> Credential:
     )
 
 
+# ========== 登录会话（进程级缓存） ==========
+
+_login_session: QrCodeLogin | None = None
+
+
 def get_cred() -> Credential:
-    """获取凭证"""
+    """获取凭证，未登录时引导用户调用 bili_login"""
     cred = load_credential()
     if not cred:
-        raise Exception("未登录！请先运行: python bili_login.py")
+        raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
     return cred
+
+
+# ========== Tool: 扫码登录（生成二维码） ==========
+
+@mcp.tool()
+async def bili_login() -> str:
+    """
+    生成B站登录二维码，返回二维码图片（base64）供用户扫码。
+    用户扫码后，调用 bili_login_check 检查登录状态。
+
+    Returns:
+        包含二维码base64图片数据的JSON，前端可直接渲染为图片展示给用户
+    """
+    global _login_session
+
+    # 如果已有凭证，直接返回
+    cred = load_credential()
+    if cred:
+        return json.dumps({
+            "status": "already_logged_in",
+            "message": "已登录B站，无需重复登录",
+        }, ensure_ascii=False)
+
+    # 生成新的登录会话
+    _login_session = QrCodeLogin()
+    await _login_session.generate_qrcode()
+
+    # 获取二维码图片的 base64（无损PNG）
+    pic = _login_session.get_qrcode_picture()
+    img_base64 = base64.b64encode(pic.content).decode("utf-8")
+
+    # 保存二维码图片到项目根目录
+    qr_file = Path(__file__).parent / "qrcode_login.png"
+    with open(qr_file, "wb") as f:
+        f.write(pic.content)
+
+    # 获取终端文本版二维码（纯文本客户端备用）
+    terminal_qr = _login_session.get_qrcode_terminal()
+
+    # 获取原始扫码URL（用户也可以手动在B站App打开）
+    qr_url = getattr(_login_session, "_QrCodeLogin__qr_link", "")
+
+    return json.dumps({
+        "status": "qrcode_ready",
+        "message": "请用B站App扫描二维码登录（180秒内有效）",
+        "qrcode_image": f"data:image/png;base64,{img_base64}",
+        "qrcode_file": str(qr_file),
+        "qrcode_terminal": terminal_qr,
+        "qrcode_url": qr_url,
+        "next_step": "用户扫码后，请调用 bili_login_check 检查登录状态",
+    }, ensure_ascii=False)
+
+
+# ========== Tool: 检查登录状态 ==========
+
+@mcp.tool()
+async def bili_login_check() -> str:
+    """
+    检查B站扫码登录状态。在用户扫码后调用此工具。
+    如果返回 "scanning" 或 "confirming"，请等待几秒后再次调用。
+    如果返回 "done"，登录成功，可以使用其他工具了。
+    如果返回 "timeout"，需要重新调用 bili_login 生成新二维码。
+
+    Returns:
+        当前登录状态
+    """
+    global _login_session
+
+    if not _login_session:
+        # 没有登录会话，检查是否已登录
+        cred = load_credential()
+        if cred:
+            return json.dumps({
+                "status": "already_logged_in",
+                "message": "已登录B站",
+            }, ensure_ascii=False)
+        return json.dumps({
+            "status": "no_session",
+            "message": "没有进行中的登录，请先调用 bili_login 生成二维码",
+        }, ensure_ascii=False)
+
+    state = await _login_session.check_state()
+
+    if state == QrCodeLoginEvents.SCAN:
+        return json.dumps({
+            "status": "scanning",
+            "message": "已扫码，等待用户在手机上确认...",
+            "next_step": "请等待3秒后再次调用 bili_login_check",
+        }, ensure_ascii=False)
+
+    elif state == QrCodeLoginEvents.CONF:
+        return json.dumps({
+            "status": "confirming",
+            "message": "用户已确认，正在处理...",
+            "next_step": "请等待2秒后再次调用 bili_login_check",
+        }, ensure_ascii=False)
+
+    elif state == QrCodeLoginEvents.TIMEOUT:
+        _login_session = None
+        # 清理二维码文件
+        qr_file = Path(__file__).parent / "qrcode_login.png"
+        if qr_file.exists():
+            qr_file.unlink()
+        return json.dumps({
+            "status": "timeout",
+            "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
+        }, ensure_ascii=False)
+
+    elif state == QrCodeLoginEvents.DONE:
+        # 登录成功，保存凭证
+        cred = _login_session.get_credential()
+        with open(CRED_FILE, "w") as f:
+            json.dump({
+                "sessdata": cred.sessdata,
+                "bili_jct": cred.bili_jct,
+                "buvid3": cred.buvid3,
+                "dedeuserid": cred.dedeuserid,
+            }, f)
+        _login_session = None
+        # 清理二维码文件
+        qr_file = Path(__file__).parent / "qrcode_login.png"
+        if qr_file.exists():
+            qr_file.unlink()
+        return json.dumps({
+            "status": "done",
+            "message": "登录成功！凭证已保存，现在可以使用所有B站功能了",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "unknown",
+        "message": f"未知状态: {state}",
+    }, ensure_ascii=False)
+
+
+# ========== Tool: 登录状态查询 ==========
+
+@mcp.tool()
+async def bili_check_credential() -> str:
+    """
+    检查当前B站登录凭证是否有效
+
+    Returns:
+        登录状态信息
+    """
+    cred = load_credential()
+    if not cred:
+        return json.dumps({
+            "logged_in": False,
+            "message": "未登录，请调用 bili_login 进行扫码登录",
+        }, ensure_ascii=False)
+
+    # 尝试用凭证请求一下，验证是否过期
+    try:
+        my_info = await user.User(
+            uid=int(cred.dedeuserid), credential=cred
+        ).get_user_info()
+        return json.dumps({
+            "logged_in": True,
+            "uid": cred.dedeuserid,
+            "username": my_info.get("name", ""),
+            "message": "凭证有效",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "logged_in": False,
+            "message": f"凭证可能已过期: {str(e)}，请重新调用 bili_login 登录",
+        }, ensure_ascii=False)
 
 
 # ========== Tool 1: 搜索视频 ==========

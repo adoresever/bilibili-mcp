@@ -1,14 +1,17 @@
-# 凭证文件（包含登录信息，绝对不能提交）
+# 凭证文件（包含登录信息，切勿提交）
 bili_credential.json
+
+# 登录二维码（临时文件）
+qrcode_login.png
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 *.egg-info/
 dist/
 build/
-.eggs/
+*.egg
 
 # 虚拟环境
 venv/
@@ -20,14 +23,8 @@ env/
 .vscode/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
-
-# 采集数据（可选提交）
-*.json
-!requirements.txt
-
-# 但保留示例
-!example_output.json
