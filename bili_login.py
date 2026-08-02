@@ -4,7 +4,7 @@
 import asyncio
 import json
 from pathlib import Path
-from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bilibili_api.login_v2 import QrCodeLogin
 
 CRED_FILE = Path(__file__).parent / "bili_credential.json"
 
@@ -16,14 +16,14 @@ async def main():
 
     while True:
         state = await qr.check_state()
-        if state == QrCodeLoginEvents.SCAN:
+        if state == 1:  # SCAN
             print("✅ 已扫码，请在手机上确认...")
-        elif state == QrCodeLoginEvents.CONF:
+        elif state == 2:  # CONF
             print("✅ 已确认...")
-        elif state == QrCodeLoginEvents.TIMEOUT:
+        elif state == 5:  # TIMEOUT
             print("❌ 二维码超时，请重新运行")
             return
-        elif state == QrCodeLoginEvents.DONE:
+        elif state == 3:  # DONE
             break
         await asyncio.sleep(2)
 
