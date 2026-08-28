@@ -12,6 +12,7 @@ import json
 import base64
 import os
 import tempfile
+import time
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -21,7 +22,18 @@ from bilibili_api.video_uploader import (
     VideoUploader, VideoUploaderPage, VideoMeta, Lines,
 )
 from bilibili_api.utils.picture import Picture
-from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bilibili_api.login_v2 import (
+    QrCodeLogin,
+    QrCodeLoginChannel,
+    QrCodeLoginEvents,
+)
+
+from bili_auth import (
+    CredentialStatus,
+    credential_is_complete,
+    load_credential,
+    validate_save_and_reload,
+)
 
 # ========== 初始化 ==========
 
@@ -30,31 +42,37 @@ CRED_FILE = Path(__file__).parent / "bili_credential.json"
 mcp = FastMCP("bilibili-mcp")
 
 
-def load_credential() -> Credential:
-    """从文件加载凭证"""
-    if not CRED_FILE.exists():
-        return None
-    with open(CRED_FILE) as f:
-        data = json.load(f)
-    return Credential(
-        sessdata=data.get("sessdata", ""),
-        bili_jct=data.get("bili_jct", ""),
-        buvid3=data.get("buvid3") or "",
-        dedeuserid=data.get("dedeuserid", ""),
-    )
-
-
 # ========== 登录会话（进程级缓存） ==========
 
 _login_session: QrCodeLogin | None = None
+_login_session_created_at: float | None = None
+_LOGIN_SESSION_MAX_AGE = 180
+QR_FILE = Path(__file__).parent / "qrcode_login.png"
 
 
-def get_cred() -> Credential:
+def _clear_login_session() -> None:
+    global _login_session, _login_session_created_at
+    _login_session = None
+    _login_session_created_at = None
+    try:
+        QR_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _session_is_expired() -> bool:
+    return bool(
+        _login_session_created_at is not None
+        and time.monotonic() - _login_session_created_at >= _LOGIN_SESSION_MAX_AGE
+    )
+
+
+async def get_cred() -> Credential:
     """获取凭证，未登录时引导用户调用 bili_login"""
-    cred = load_credential()
-    if not cred:
+    result = await load_credential(CRED_FILE)
+    if result.status != CredentialStatus.VALID or result.credential is None:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
-    return cred
+    return result.credential
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -68,27 +86,36 @@ async def bili_login() -> str:
     Returns:
         包含二维码base64图片数据的JSON，前端可直接渲染为图片展示给用户
     """
-    global _login_session
+    global _login_session, _login_session_created_at
 
-    # 如果已有凭证，直接返回
-    cred = load_credential()
-    if cred:
+    credential_result = await load_credential(CRED_FILE)
+    if credential_result.status == CredentialStatus.VALID:
         return json.dumps({
             "status": "already_logged_in",
             "message": "已登录B站，无需重复登录",
         }, ensure_ascii=False)
 
-    # 生成新的登录会话
-    _login_session = QrCodeLogin()
+    if _login_session is not None and not _session_is_expired():
+        if not _login_session.has_done():
+            return json.dumps({
+                "status": "login_in_progress",
+                "message": "已有进行中的扫码登录，请继续使用原二维码",
+                "next_step": "请调用 bili_login_check 检查登录状态",
+            }, ensure_ascii=False)
+    if _login_session is not None:
+        _clear_login_session()
+
+    # TV 登录结果直接提供 cookie_info，不依赖 Web 回调 URL 中的 Cookie。
+    _login_session = QrCodeLogin(platform=QrCodeLoginChannel.TV)
     await _login_session.generate_qrcode()
+    _login_session_created_at = time.monotonic()
 
     # 获取二维码图片的 base64（无损PNG）
     pic = _login_session.get_qrcode_picture()
     img_base64 = base64.b64encode(pic.content).decode("utf-8")
 
     # 保存二维码图片到项目根目录
-    qr_file = Path(__file__).parent / "qrcode_login.png"
-    with open(qr_file, "wb") as f:
+    with open(QR_FILE, "wb") as f:
         f.write(pic.content)
 
     # 获取终端文本版二维码（纯文本客户端备用）
@@ -101,7 +128,7 @@ async def bili_login() -> str:
         "status": "qrcode_ready",
         "message": "请用B站App扫描二维码登录（180秒内有效）",
         "qrcode_image": f"data:image/png;base64,{img_base64}",
-        "qrcode_file": str(qr_file),
+        "qrcode_file": str(QR_FILE),
         "qrcode_terminal": terminal_qr,
         "qrcode_url": qr_url,
         "next_step": "用户扫码后，请调用 bili_login_check 检查登录状态",
@@ -124,63 +151,80 @@ async def bili_login_check() -> str:
     global _login_session
 
     if not _login_session:
-        # 没有登录会话，检查是否已登录
-        cred = load_credential()
-        if cred:
+        credential_result = await load_credential(CRED_FILE)
+        if credential_result.status == CredentialStatus.VALID:
             return json.dumps({
                 "status": "already_logged_in",
                 "message": "已登录B站",
             }, ensure_ascii=False)
         return json.dumps({
             "status": "no_session",
-            "message": "没有进行中的登录，请先调用 bili_login 生成二维码",
+            "credential_status": credential_result.status.value,
+            "message": "没有进行中的登录；MCP 进程可能已重启，请重新调用 bili_login",
         }, ensure_ascii=False)
 
-    state = await _login_session.check_state()
+    if _session_is_expired():
+        _clear_login_session()
+        return json.dumps({
+            "status": "timeout",
+            "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
+        }, ensure_ascii=False)
+
+    try:
+        state = await _login_session.check_state()
+    except Exception as error:
+        return json.dumps({
+            "status": "login_check_failed",
+            "message": f"登录状态查询失败（{type(error).__name__}），请稍后重试",
+        }, ensure_ascii=False)
 
     if state == QrCodeLoginEvents.SCAN:
         return json.dumps({
             "status": "scanning",
-            "message": "已扫码，等待用户在手机上确认...",
+            "message": "等待用户扫描二维码...",
             "next_step": "请等待3秒后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.CONF:
         return json.dumps({
             "status": "confirming",
-            "message": "用户已确认，正在处理...",
+            "message": "二维码已扫描，等待用户在手机上确认...",
             "next_step": "请等待2秒后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.TIMEOUT:
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+        _clear_login_session()
         return json.dumps({
             "status": "timeout",
             "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.DONE:
-        # 登录成功，保存凭证
-        cred = _login_session.get_credential()
-        with open(CRED_FILE, "w") as f:
-            json.dump({
-                "sessdata": cred.sessdata,
-                "bili_jct": cred.bili_jct,
-                "buvid3": cred.buvid3,
-                "dedeuserid": cred.dedeuserid,
-            }, f)
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+        try:
+            credential = _login_session.get_credential()
+        except Exception as error:
+            return json.dumps({
+                "status": "credential_unavailable",
+                "message": f"二维码已确认，但凭证提取失败（{type(error).__name__}）",
+            }, ensure_ascii=False)
+
+        if not credential_is_complete(credential):
+            return json.dumps({
+                "status": "credential_incomplete",
+                "message": "二维码已确认，但未取得有效登录凭证",
+            }, ensure_ascii=False)
+
+        credential_result = await validate_save_and_reload(CRED_FILE, credential)
+        if credential_result.status != CredentialStatus.VALID:
+            return json.dumps({
+                "status": credential_result.status.value,
+                "message": "二维码已确认，但登录凭证验证未通过",
+            }, ensure_ascii=False)
+
+        _clear_login_session()
         return json.dumps({
             "status": "done",
-            "message": "登录成功！凭证已保存，现在可以使用所有B站功能了",
+            "message": "登录成功！凭证已验证并保存，现在可以使用所有B站功能了",
         }, ensure_ascii=False)
 
     return json.dumps({
@@ -199,29 +243,23 @@ async def bili_check_credential() -> str:
     Returns:
         登录状态信息
     """
-    cred = load_credential()
-    if not cred:
+    credential_result = await load_credential(CRED_FILE)
+    if credential_result.status != CredentialStatus.VALID:
         return json.dumps({
             "logged_in": False,
-            "message": "未登录，请调用 bili_login 进行扫码登录",
+            "credential_status": credential_result.status.value,
+            "message": "当前没有有效登录凭证，请调用 bili_login 重新登录",
         }, ensure_ascii=False)
 
-    # 尝试用凭证请求一下，验证是否过期
-    try:
-        my_info = await user.User(
-            uid=int(cred.dedeuserid), credential=cred
-        ).get_user_info()
-        return json.dumps({
-            "logged_in": True,
-            "uid": cred.dedeuserid,
-            "username": my_info.get("name", ""),
-            "message": "凭证有效",
-        }, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({
-            "logged_in": False,
-            "message": f"凭证可能已过期: {str(e)}，请重新调用 bili_login 登录",
-        }, ensure_ascii=False)
+    credential = credential_result.credential
+    my_info = credential_result.user_info or {}
+    return json.dumps({
+        "logged_in": True,
+        "credential_status": CredentialStatus.VALID.value,
+        "uid": credential.dedeuserid,
+        "username": my_info.get("name", ""),
+        "message": "凭证有效",
+    }, ensure_ascii=False)
 
 
 # ========== Tool 1: 搜索视频 ==========
@@ -286,7 +324,7 @@ async def bili_comments(bvid: str, num: int = 30) -> str:
     Returns:
         JSON格式的评论列表，包含用户名、评论内容、点赞数、回复数
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
@@ -350,7 +388,7 @@ async def bili_subtitle(bvid: str) -> str:
     Returns:
         视频的完整字幕文本
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
     info = await v.get_info()
@@ -412,7 +450,7 @@ async def bili_danmaku(bvid: str, num: int = 100) -> str:
     Returns:
         弹幕列表，包含弹幕文本和出现时间
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
     danmakus = await v.get_danmakus(page_index=0)
@@ -439,7 +477,7 @@ async def bili_video_info(bvid: str) -> str:
     Returns:
         视频标题、描述、UP主、播放量、评论数、收藏数等详细数据
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     stat = info.get("stat", {})
@@ -481,7 +519,7 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
     Returns:
         发表结果
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
@@ -530,7 +568,7 @@ async def bili_crawl(keyword: str, max_videos: int = 5, comments_per_video: int 
     Returns:
         包含视频信息、评论和字幕的完整采集数据
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     # 搜索
     search_result = await search.search_by_type(
@@ -644,7 +682,7 @@ async def bili_send_dynamic(
     if not text or not text.strip():
         return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
 
-    cred = get_cred()
+    cred = await get_cred()
 
     dyn = dynamic.BuildDynamic.empty()
     dyn.add_plain_text(text.strip())
@@ -728,7 +766,7 @@ async def bili_upload_video(
     if not title or not title.strip():
         return json.dumps({"success": False, "error": "title 不能为空"}, ensure_ascii=False)
 
-    cred = get_cred()
+    cred = await get_cred()
 
     try:
         # 准备分P
@@ -820,7 +858,7 @@ async def bili_upload_video_multi(
     Returns:
         上传结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     if not video_paths:
         return json.dumps({"success": False, "error": "video_paths 不能为空"}, ensure_ascii=False)
@@ -893,7 +931,7 @@ async def bili_send_opus(
     Returns:
         发布结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     dyn = dynamic.BuildDynamic.empty()
 
@@ -1109,7 +1147,7 @@ async def bili_user_info(uid: int) -> str:
     Returns:
         用户昵称、粉丝数、关注数、签名、等级、视频数等
     """
-    cred = get_cred()
+    cred = await get_cred()
     u = user.User(uid=uid, credential=cred)
     info = await u.get_user_info()
 
@@ -1159,7 +1197,7 @@ async def bili_user_videos(uid: int, pn: int = 1, ps: int = 30, order: str = "pu
     Returns:
         视频列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     u = user.User(uid=uid, credential=cred)
 
     order_map = {
@@ -1203,13 +1241,15 @@ async def bili_favorite_lists(uid: int = 0) -> str:
     Returns:
         收藏夹列表，包含ID、名称、视频数量
     """
-    cred = get_cred()
+    cred = await get_cred()
     if uid == 0:
-        # 从凭证获取自己的UID
-        import json as _json
-        with open(CRED_FILE) as f:
-            data = _json.load(f)
-        uid = int(data.get("dedeuserid", 0))
+        own_uid = str(cred.dedeuserid or "")
+        if not own_uid.isdigit() or int(own_uid) <= 0:
+            return json.dumps({
+                "success": False,
+                "error": "凭证有效，但未能取得当前用户 UID",
+            }, ensure_ascii=False)
+        uid = int(own_uid)
 
     result = await favorite_list.get_video_favorite_list(uid=uid, credential=cred)
     fav_lists = []
@@ -1238,7 +1278,7 @@ async def bili_favorite_content(media_id: int, page: int = 1, keyword: str = "")
     Returns:
         收藏夹内的视频列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     result = await favorite_list.get_video_favorite_list_content(
         media_id=media_id,
         page=page,
@@ -1279,7 +1319,7 @@ async def bili_send_message(receiver_uid: int, text: str) -> str:
     Returns:
         发送结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     if not text or not text.strip():
         return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
@@ -1310,7 +1350,7 @@ async def bili_unread_messages() -> str:
     Returns:
         各类未读消息数量
     """
-    cred = get_cred()
+    cred = await get_cred()
     try:
         result = await session.get_unread_messages(credential=cred)
         return json.dumps(result, ensure_ascii=False)
@@ -1328,7 +1368,7 @@ async def bili_received_replies() -> str:
     Returns:
         回复列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     try:
         result = await session.get_replies(credential=cred)
         return json.dumps(result, ensure_ascii=False)
@@ -1346,7 +1386,7 @@ async def bili_received_at_and_likes() -> str:
     Returns:
         包含 at 和 likes 两部分的通知数据
     """
-    cred = get_cred()
+    cred = await get_cred()
     result = {}
     try:
         result["at"] = await session.get_at(credential=cred)
