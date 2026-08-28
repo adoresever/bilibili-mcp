@@ -1,11 +1,13 @@
 # 凭证文件（包含登录信息，切勿提交）
-bili_credential.json
+bili_credential.json*
+.bili_credential.json.*.tmp
 
 # 登录二维码（临时文件）
 qrcode_login.png
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.egg-info/
