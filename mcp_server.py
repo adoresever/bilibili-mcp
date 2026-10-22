@@ -18,8 +18,9 @@ from mcp.server.fastmcp import FastMCP
 from bilibili_api import video, search, comment, Credential, dynamic, opus
 from bilibili_api import hot, rank, user, session, favorite_list
 from bilibili_api.video_uploader import (
-    VideoUploader, VideoUploaderPage, VideoMeta, Lines,
+    VideoUploader, VideoUploaderPage, VideoMeta, Lines, upload_cover,
 )
+from datetime import datetime
 from bilibili_api.utils.picture import Picture
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
@@ -684,6 +685,28 @@ async def bili_send_dynamic(
 
 # ========== Tool 9: 上传视频 ==========
 
+def _current_tids() -> dict:
+    """bilibili_api 自带的当前分区表 {子分区ID: "主分区 → 子分区"}；旧分区 ID 不在其中"""
+    import bilibili_api
+    path = Path(bilibili_api.__file__).parent / "data" / "video_uploader_meta_pre.json"
+    with open(path, encoding="utf-8") as f:
+        tid_list = json.load(f)["tid_list"]
+    return {c["id"]: f'{p["name"]} → {c["name"]}' for p in tid_list for c in p["children"]}
+
+
+class _MetaWithExtra(VideoMeta):
+    """在 VideoMeta 生成的投稿参数上追加库里没有的字段（cover43、creation_statement）"""
+
+    def __init__(self, extra: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.extra = extra
+
+    def __dict__(self) -> dict:
+        d = super().__dict__()
+        d.update(self.extra)
+        return d
+
+
 @mcp.tool()
 async def bili_upload_video(
     video_path: str,
@@ -695,6 +718,9 @@ async def bili_upload_video(
     source: str = "",
     dynamic_text: str = "",
     no_reprint: bool = True,
+    cover43_path: str = "",
+    publish_time: str = "",
+    ai_content: bool = False,
 ) -> str:
     """
     上传视频到B站
@@ -704,20 +730,37 @@ async def bili_upload_video(
         title: 视频标题（最多80字）
         desc: 视频简介描述
         tid: 分区ID，默认124（趣味科普人文-社科·法律·心理）。
-             常用分区：17=单机游戏 21=日常 95=数码 122=野生技术协会
-             124=社科 160=生活记录 171=电子竞技 183=影视杂谈
-             188=科技资讯 201=科学 207=财经商业 208=科技 209=手工
-             230=其他(生活) 231=美食 234=健身 32=完结动画
+             常用分区：231=科技·计算机技术 230=科技·软件应用 95=科技·数码
+             201=知识·科学科普 122=知识·野生技能协会 207=知识·财经商业
+             228=知识·人文历史 21=生活·日常 17=游戏·单机游戏 171=游戏·电子竞技
+             完整列表用 bili_video_zones 查询；已下线的分区 ID 会被拒绝
         tags: 标签，逗号分隔，如"AI,教程,编程"（至少1个标签）
         cover_path: 封面图片路径（可选，不填则B站自动截取）
         source: 转载来源URL（非原创时必填）
         dynamic_text: 粉丝动态文本（可选，投稿时同步发布的动态内容）
         no_reprint: 是否启用未经作者授权禁止转载，默认True
+        cover43_path: 4:3 封面图片路径（可选，用于首页等 4:3 位置）
+        publish_time: 定时发布时间，本机时区 "YYYY-MM-DD HH:MM"（可选，需距现在 2 小时~15 天；不填则立即发布）
+        ai_content: 创作声明"含AI生成内容"，默认False
 
     Returns:
         上传结果，包含BV号
     """
     # ---- 参数校验 ----
+    # 定时发布最先校验：时间写错时宁可不传，也不能变成立即发布
+    delay_time = None
+    if publish_time and publish_time.strip():
+        try:
+            delay_time = int(datetime.strptime(publish_time.strip(), "%Y-%m-%d %H:%M").timestamp())
+        except ValueError:
+            return json.dumps({"success": False, "error": "publish_time 格式应为 \"YYYY-MM-DD HH:MM\""}, ensure_ascii=False)
+        if not time.time() + 7200 <= delay_time <= time.time() + 15 * 86400:
+            return json.dumps({"success": False, "error": "publish_time 需距现在 2 小时~15 天"}, ensure_ascii=False)
+
+    # 已下线的分区 ID 会被B站默默放进"生活 → 日常"，提前拦下
+    if tid not in _current_tids():
+        return json.dumps({"success": False, "error": f"分区 {tid} 已不存在，请用当前分区 ID"}, ensure_ascii=False)
+
     if not video_path or not video_path.strip():
         return json.dumps({"success": False, "error": "video_path 不能为空，请提供视频文件的本地路径"}, ensure_ascii=False)
 
@@ -727,6 +770,10 @@ async def bili_upload_video(
 
     if not title or not title.strip():
         return json.dumps({"success": False, "error": "title 不能为空"}, ensure_ascii=False)
+
+    cover43_path = (cover43_path or "").strip()
+    if cover43_path and not os.path.isfile(cover43_path):
+        return json.dumps({"success": False, "error": f"4:3 封面文件不存在: {cover43_path}"}, ensure_ascii=False)
 
     cred = get_cred()
 
@@ -752,7 +799,15 @@ async def bili_upload_video(
         else:
             cover_pic = _extract_cover_from_video(video_path)
 
-        meta = VideoMeta(
+        # VideoMeta 不支持的投稿字段：4:3 封面 URL、创作声明（id 1 = 含AI生成内容）
+        extra = {}
+        if cover43_path:
+            extra["cover43"] = await upload_cover(Picture.from_file(cover43_path), cred)
+        if ai_content:
+            extra["creation_statement"] = {"id": 1}
+
+        meta = _MetaWithExtra(
+            extra,
             tid=tid,
             title=title.strip()[:80],
             desc=desc or "",
@@ -762,6 +817,7 @@ async def bili_upload_video(
             source=source.strip() if source and source.strip() else None,
             no_reprint=no_reprint if is_original else False,
             dynamic=dynamic_text.strip() if dynamic_text and dynamic_text.strip() else None,
+            delay_time=delay_time,
         )
 
         uploader = VideoUploader(
@@ -932,40 +988,16 @@ async def bili_send_opus(
 @mcp.tool()
 async def bili_video_zones() -> str:
     """
-    获取B站视频常用分区ID列表，供上传视频时选择tid参数
+    获取B站当前投稿分区ID列表（来自 bilibili_api 自带的分区表），供上传视频时选择tid参数
 
     Returns:
-        常用分区ID及名称
+        {主分区: {子分区ID: 子分区名}}
     """
-    zones = {
-        "科技": {
-            188: "科技资讯", 122: "野生技术协会", 95: "数码",
-            208: "科技", 209: "手工",
-        },
-        "知识": {
-            201: "科学", 124: "社科·法律·心理", 207: "财经商业",
-            228: "人文历史", 36: "科技(知识)",
-        },
-        "生活": {
-            21: "日常", 160: "生活记录", 230: "其他",
-            231: "美食", 234: "健身", 161: "搞笑",
-        },
-        "游戏": {
-            17: "单机游戏", 171: "电子竞技", 172: "手机游戏",
-            65: "网络游戏",
-        },
-        "影视": {
-            183: "影视杂谈", 138: "搞笑", 182: "影视剪辑",
-        },
-        "动画": {
-            32: "完结动画", 33: "连载动画", 51: "MAD·AMV",
-        },
-        "音乐": {
-            28: "原创音乐", 31: "翻唱", 59: "演奏",
-        },
-    }
+    zones = {}
+    for tid, name in _current_tids().items():
+        parent, child = name.split(" → ")
+        zones.setdefault(parent, {})[tid] = child
     return json.dumps(zones, ensure_ascii=False)
-
 
 # ========================================================================
 #                        V1.2 — 数据分析 & 互动运营
