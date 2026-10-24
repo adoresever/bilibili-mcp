@@ -21,7 +21,9 @@ from bilibili_api.video_uploader import (
     VideoUploader, VideoUploaderPage, VideoMeta, Lines,
 )
 from bilibili_api.utils.picture import Picture
-from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bili_login_flow import QrCodeLogin, QrCodeLoginEvents
+from bili_login_flow import load_credential as load_saved_credential
+from bili_login_flow import save_credential as save_saved_credential
 
 # ========== 初始化 ==========
 
@@ -32,15 +34,16 @@ mcp = FastMCP("bilibili-mcp")
 
 def load_credential() -> Credential:
     """从文件加载凭证"""
-    if not CRED_FILE.exists():
+    data = load_saved_credential(CRED_FILE)
+    if not data:
         return None
-    with open(CRED_FILE) as f:
-        data = json.load(f)
     return Credential(
-        sessdata=data.get("sessdata", ""),
-        bili_jct=data.get("bili_jct", ""),
-        buvid3=data.get("buvid3") or "",
-        dedeuserid=data.get("dedeuserid", ""),
+        sessdata=data.sessdata,
+        bili_jct=data.bili_jct,
+        buvid3=data.buvid3 or None,
+        buvid4=data.buvid4 or None,
+        dedeuserid=data.dedeuserid,
+        ac_time_value=data.ac_time_value or None,
     )
 
 
@@ -78,24 +81,28 @@ async def bili_login() -> str:
             "message": "已登录B站，无需重复登录",
         }, ensure_ascii=False)
 
+    # 释放上一轮未完成的登录会话，避免连接泄漏
+    if _login_session is not None:
+        await _login_session.close()
+
     # 生成新的登录会话
     _login_session = QrCodeLogin()
     await _login_session.generate_qrcode()
 
-    # 获取二维码图片的 base64（无损PNG）
-    pic = _login_session.get_qrcode_picture()
-    img_base64 = base64.b64encode(pic.content).decode("utf-8")
+    # 获取二维码图片（无损PNG）
+    pic_content = _login_session.get_qrcode_picture()
+    img_base64 = base64.b64encode(pic_content).decode("utf-8")
 
     # 保存二维码图片到项目根目录
     qr_file = Path(__file__).parent / "qrcode_login.png"
     with open(qr_file, "wb") as f:
-        f.write(pic.content)
+        f.write(pic_content)
 
     # 获取终端文本版二维码（纯文本客户端备用）
     terminal_qr = _login_session.get_qrcode_terminal()
 
     # 获取原始扫码URL（用户也可以手动在B站App打开）
-    qr_url = getattr(_login_session, "_QrCodeLogin__qr_link", "")
+    qr_url = _login_session.get_qrcode_url()
 
     return json.dumps({
         "status": "qrcode_ready",
@@ -153,6 +160,7 @@ async def bili_login_check() -> str:
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.TIMEOUT:
+        await _login_session.close()
         _login_session = None
         # 清理二维码文件
         qr_file = Path(__file__).parent / "qrcode_login.png"
@@ -164,15 +172,10 @@ async def bili_login_check() -> str:
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.DONE:
-        # 登录成功，保存凭证
-        cred = _login_session.get_credential()
-        with open(CRED_FILE, "w") as f:
-            json.dump({
-                "sessdata": cred.sessdata,
-                "bili_jct": cred.bili_jct,
-                "buvid3": cred.buvid3,
-                "dedeuserid": cred.dedeuserid,
-            }, f)
+        # 登录成功，保存凭证（含 refresh_token，支持持久登录）
+        credential = _login_session.get_credential()
+        save_saved_credential(credential, CRED_FILE)
+        await _login_session.close()
         _login_session = None
         # 清理二维码文件
         qr_file = Path(__file__).parent / "qrcode_login.png"
@@ -180,7 +183,7 @@ async def bili_login_check() -> str:
             qr_file.unlink()
         return json.dumps({
             "status": "done",
-            "message": "登录成功！凭证已保存，现在可以使用所有B站功能了",
+            "message": "登录成功！凭证已保存（含 refresh token，可持久登录），现在可以使用所有B站功能了",
         }, ensure_ascii=False)
 
     return json.dumps({
