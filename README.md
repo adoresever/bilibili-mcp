@@ -33,10 +33,18 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 | Tool | 功能 | 说明 |
 |------|------|------|
 | `bili_send_dynamic` | 发图文动态 | 发布文字/图文动态，支持定时发布、话题关联 |
-| `bili_upload_video` | 上传视频 | 单P视频上传，支持封面、标签、分区选择 |
-| `bili_upload_video_multi` | 多P上传 | 多分P视频合并投稿 |
+| `bili_upload_video` | 上传视频 | 单P视频上传，支持封面、标签、分区选择、投稿后直接进合集（`season_id`） |
+| `bili_upload_video_multi` | 多P上传 | 多分P视频合并投稿，同样支持 `season_id` |
+| `bili_seasons` | 合集列表 | 列出自己的合集和小节（`section_id`），拿 `season_id` 给上传用 |
+| `bili_set_season` | 挂/摘合集 | 给已投稿的视频加进合集，或从合集移除 |
+| `bili_season_sync` | 合集补挂 | 把「已发布但不在合集」的稿件补进去，幂等，可 `dry_run` |
 | `bili_send_opus` | 图文专栏 | 发布图文长内容（Opus） |
 | `bili_video_zones` | 分区查询 | 获取常用分区ID，辅助视频上传 |
+
+> **合集（新版合集 / season）**：投稿接口不收合集字段，所以视频是在投稿成功之后用
+> `x2/creative/web/season/section/episodes/add` 挂进合集的小节里。
+> 定时待发的稿件 B 站不允许加（返回 `62003`），要等它真正发布之后才能挂——
+> 这就是 `bili_season_sync` 存在的理由：重复调用幂等，可以放在定时任务里一直补。
 
 ### 数据分析
 
