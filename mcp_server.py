@@ -8,53 +8,167 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 """
 
 import asyncio
+import contextlib
+import functools
 import json
 import base64
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from bilibili_api import video, search, comment, Credential, dynamic, opus
 from bilibili_api import hot, rank, user, session, favorite_list
 from bilibili_api.video_uploader import (
-    VideoUploader, VideoUploaderPage, VideoMeta, Lines,
+    VideoUploader, VideoUploaderPage, VideoMeta, Lines, upload_cover,
 )
+from datetime import datetime
 from bilibili_api.utils.picture import Picture
-from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bilibili_api.login_v2 import (
+    QrCodeLogin,
+    QrCodeLoginChannel,
+    QrCodeLoginEvents,
+)
+
+from secure_store import redact
+from bili_auth import (
+    CredentialStatus,
+    credential_is_complete,
+    load_credential,
+    validate_save_and_reload,
+)
 
 # ========== 初始化 ==========
 
-CRED_FILE = Path(__file__).parent / "bili_credential.json"
+CRED_FILE = Path(__file__).parent / "bili_credential.enc"
 
 mcp = FastMCP("bilibili-mcp")
 
 
-def load_credential() -> Credential:
-    """从文件加载凭证"""
-    if not CRED_FILE.exists():
-        return None
-    with open(CRED_FILE) as f:
-        data = json.load(f)
-    return Credential(
-        sessdata=data.get("sessdata", ""),
-        bili_jct=data.get("bili_jct", ""),
-        buvid3=data.get("buvid3") or "",
-        dedeuserid=data.get("dedeuserid", ""),
-    )
+# 所有工具的返回值和报错都先经过 redact()：即使 B 站接口在报错里带回 cookie / token，也不会传给 AI。
+_register_tool = mcp.tool
+
+
+def _safe_tool(*args, **kwargs):
+    register = _register_tool(*args, **kwargs)
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def guarded(*a, **kw):
+            try:
+                out = await fn(*a, **kw)
+            except Exception as e:
+                raise Exception(redact(str(e))) from None
+            return redact(out) if isinstance(out, str) else out
+        return register(guarded)
+    return wrap
+
+
+mcp.tool = _safe_tool
 
 
 # ========== 登录会话（进程级缓存） ==========
 
 _login_session: QrCodeLogin | None = None
+_login_session_created_at: float | None = None
+_LOGIN_SESSION_MAX_AGE = 180
+QR_FILE = Path(__file__).parent / "qrcode_login.png"
 
 
-def get_cred() -> Credential:
+def _clear_login_session() -> None:
+    global _login_session, _login_session_created_at
+    _login_session = None
+    _login_session_created_at = None
+    try:
+        QR_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _session_is_expired() -> bool:
+    return bool(
+        _login_session_created_at is not None
+        and time.monotonic() - _login_session_created_at >= _LOGIN_SESSION_MAX_AGE
+    )
+
+
+async def get_cred() -> Credential:
     """获取凭证，未登录时引导用户调用 bili_login"""
-    cred = load_credential()
-    if not cred:
+    result = await load_credential(CRED_FILE)
+    if result.status == CredentialStatus.LOCKED:
+        raise Exception("B站凭证是加密的，需要用户在弹出的对话框里输入口令；用户取消了或口令错误。请让用户重试，不要重新扫码登录。")
+    if result.status != CredentialStatus.VALID or result.credential is None:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
-    return cred
+    return result.credential
+
+
+# ========== 上传鲁棒性：慢链路 / 海外线路 ==========
+# 海外网络到 upos CDN 的单连接上行常常只有几十 KB/s，一块 10 MB 数据在规定时间内写不完，
+# bilibili_api 就对每块判失败并无限重传，调用方看到的是"一直卡着"。这里三件事：
+#   1) 把上传期间的 HTTP 超时放大（默认 30s → 1800s，可用 BILI_MCP_UPLOAD_TIMEOUT 覆盖）
+#   2) 提高分块并发（服务端默认 4 → 12，可用 BILI_MCP_UPLOAD_THREADS 覆盖）
+#   3) 加停滞看门狗：长时间没有任何进度事件就取消并把最后阶段回报给调用方
+UPLOAD_REQUEST_TIMEOUT = float(os.environ.get("BILI_MCP_UPLOAD_TIMEOUT", "1800"))
+UPLOAD_CHUNK_THREADS = int(os.environ.get("BILI_MCP_UPLOAD_THREADS", "12"))
+UPLOAD_STALL_SEC = float(os.environ.get("BILI_MCP_UPLOAD_STALL", "900"))
+
+
+def _event_label(event) -> str:
+    """把上传事件压成一行人话：只留事件名和 offset/size/info 这类有用字段。"""
+    if not isinstance(event, dict):
+        return str(event)[:160]
+    name, data = event.get("name"), event.get("data")
+    info = ""
+    if isinstance(data, tuple) and data and isinstance(data[0], dict):
+        detail = {k: v for k, v in data[0].items() if k != "page" and not hasattr(v, "path")}
+        info = json.dumps(detail, ensure_ascii=False, default=str)[:200]
+    return f"{name} {info}".strip()
+
+
+@contextlib.contextmanager
+def _upload_tuning():
+    """上传期间放大超时、提高分块并发；退出时恢复原状（同一进程里的其它请求不受影响）。"""
+    from bilibili_api import request_settings
+    from bilibili_api.video_uploader import VideoUploader
+
+    old_timeout = request_settings.get_timeout()
+    orig_preupload = VideoUploader._preupload
+
+    async def preupload(self, page):
+        pre = await orig_preupload(self, page)
+        try:
+            pre["threads"] = max(int(pre.get("threads") or 1), UPLOAD_CHUNK_THREADS)
+        except (TypeError, ValueError):
+            pass
+        return pre
+
+    request_settings.set_timeout(UPLOAD_REQUEST_TIMEOUT)
+    VideoUploader._preupload = preupload
+    try:
+        yield
+    finally:
+        request_settings.set_timeout(old_timeout)
+        VideoUploader._preupload = orig_preupload
+
+
+async def _start_with_watchdog(uploader, progress: dict) -> dict:
+    """跑完上传；UPLOAD_STALL_SEC 秒内没有任何进度就取消，给出可读错误而不是挂死。"""
+    task = asyncio.ensure_future(uploader.start())
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=15)
+        if done:
+            return task.result()
+        idle = time.monotonic() - progress.get("last", started)
+        stalled = UPLOAD_STALL_SEC and idle > UPLOAD_STALL_SEC
+        if stalled:
+            task.cancel()
+            raise TimeoutError(
+                f"上传停滞 {idle:.0f} 秒（最后阶段：{progress.get('phase', 'init')}）；"
+                f"海外线路可调大 BILI_MCP_UPLOAD_STALL 或换网络重试"
+            )
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -68,27 +182,42 @@ async def bili_login() -> str:
     Returns:
         包含二维码base64图片数据的JSON，前端可直接渲染为图片展示给用户
     """
-    global _login_session
+    global _login_session, _login_session_created_at
 
-    # 如果已有凭证，直接返回
-    cred = load_credential()
-    if cred:
+    credential_result = await load_credential(CRED_FILE)
+    if credential_result.status == CredentialStatus.VALID:
         return json.dumps({
             "status": "already_logged_in",
             "message": "已登录B站，无需重复登录",
         }, ensure_ascii=False)
+    if credential_result.status == CredentialStatus.LOCKED:
+        return json.dumps({
+            "status": "credential_locked",
+            "message": "已有加密凭证，但口令输入被取消或错误。请让用户再试一次；"
+                       "如果用户忘了口令，需要用户自己删除 bili_credential.enc 后再重新扫码登录。",
+        }, ensure_ascii=False)
 
-    # 生成新的登录会话
-    _login_session = QrCodeLogin()
+    if _login_session is not None and not _session_is_expired():
+        if not _login_session.has_done():
+            return json.dumps({
+                "status": "login_in_progress",
+                "message": "已有进行中的扫码登录，请继续使用原二维码",
+                "next_step": "请调用 bili_login_check 检查登录状态",
+            }, ensure_ascii=False)
+    if _login_session is not None:
+        _clear_login_session()
+
+    # TV 登录结果直接提供 cookie_info，不依赖 Web 回调 URL 中的 Cookie。
+    _login_session = QrCodeLogin(platform=QrCodeLoginChannel.TV)
     await _login_session.generate_qrcode()
+    _login_session_created_at = time.monotonic()
 
     # 获取二维码图片的 base64（无损PNG）
     pic = _login_session.get_qrcode_picture()
     img_base64 = base64.b64encode(pic.content).decode("utf-8")
 
     # 保存二维码图片到项目根目录
-    qr_file = Path(__file__).parent / "qrcode_login.png"
-    with open(qr_file, "wb") as f:
+    with open(QR_FILE, "wb") as f:
         f.write(pic.content)
 
     # 获取终端文本版二维码（纯文本客户端备用）
@@ -101,7 +230,7 @@ async def bili_login() -> str:
         "status": "qrcode_ready",
         "message": "请用B站App扫描二维码登录（180秒内有效）",
         "qrcode_image": f"data:image/png;base64,{img_base64}",
-        "qrcode_file": str(qr_file),
+        "qrcode_file": str(QR_FILE),
         "qrcode_terminal": terminal_qr,
         "qrcode_url": qr_url,
         "next_step": "用户扫码后，请调用 bili_login_check 检查登录状态",
@@ -124,63 +253,80 @@ async def bili_login_check() -> str:
     global _login_session
 
     if not _login_session:
-        # 没有登录会话，检查是否已登录
-        cred = load_credential()
-        if cred:
+        credential_result = await load_credential(CRED_FILE)
+        if credential_result.status == CredentialStatus.VALID:
             return json.dumps({
                 "status": "already_logged_in",
                 "message": "已登录B站",
             }, ensure_ascii=False)
         return json.dumps({
             "status": "no_session",
-            "message": "没有进行中的登录，请先调用 bili_login 生成二维码",
+            "credential_status": credential_result.status.value,
+            "message": "没有进行中的登录；MCP 进程可能已重启，请重新调用 bili_login",
         }, ensure_ascii=False)
 
-    state = await _login_session.check_state()
+    if _session_is_expired():
+        _clear_login_session()
+        return json.dumps({
+            "status": "timeout",
+            "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
+        }, ensure_ascii=False)
+
+    try:
+        state = await _login_session.check_state()
+    except Exception as error:
+        return json.dumps({
+            "status": "login_check_failed",
+            "message": f"登录状态查询失败（{type(error).__name__}），请稍后重试",
+        }, ensure_ascii=False)
 
     if state == QrCodeLoginEvents.SCAN:
         return json.dumps({
             "status": "scanning",
-            "message": "已扫码，等待用户在手机上确认...",
+            "message": "等待用户扫描二维码...",
             "next_step": "请等待3秒后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.CONF:
         return json.dumps({
             "status": "confirming",
-            "message": "用户已确认，正在处理...",
+            "message": "二维码已扫描，等待用户在手机上确认...",
             "next_step": "请等待2秒后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.TIMEOUT:
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+        _clear_login_session()
         return json.dumps({
             "status": "timeout",
             "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
         }, ensure_ascii=False)
 
     elif state == QrCodeLoginEvents.DONE:
-        # 登录成功，保存凭证
-        cred = _login_session.get_credential()
-        with open(CRED_FILE, "w") as f:
-            json.dump({
-                "sessdata": cred.sessdata,
-                "bili_jct": cred.bili_jct,
-                "buvid3": cred.buvid3,
-                "dedeuserid": cred.dedeuserid,
-            }, f)
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+        try:
+            credential = _login_session.get_credential()
+        except Exception as error:
+            return json.dumps({
+                "status": "credential_unavailable",
+                "message": f"二维码已确认，但凭证提取失败（{type(error).__name__}）",
+            }, ensure_ascii=False)
+
+        if not credential_is_complete(credential):
+            return json.dumps({
+                "status": "credential_incomplete",
+                "message": "二维码已确认，但未取得有效登录凭证",
+            }, ensure_ascii=False)
+
+        credential_result = await validate_save_and_reload(CRED_FILE, credential)
+        if credential_result.status != CredentialStatus.VALID:
+            return json.dumps({
+                "status": credential_result.status.value,
+                "message": "二维码已确认，但登录凭证验证未通过",
+            }, ensure_ascii=False)
+
+        _clear_login_session()
         return json.dumps({
             "status": "done",
-            "message": "登录成功！凭证已保存，现在可以使用所有B站功能了",
+            "message": "登录成功！凭证已验证并保存，现在可以使用所有B站功能了",
         }, ensure_ascii=False)
 
     return json.dumps({
@@ -199,29 +345,23 @@ async def bili_check_credential() -> str:
     Returns:
         登录状态信息
     """
-    cred = load_credential()
-    if not cred:
+    credential_result = await load_credential(CRED_FILE)
+    if credential_result.status != CredentialStatus.VALID:
         return json.dumps({
             "logged_in": False,
-            "message": "未登录，请调用 bili_login 进行扫码登录",
+            "credential_status": credential_result.status.value,
+            "message": "当前没有有效登录凭证，请调用 bili_login 重新登录",
         }, ensure_ascii=False)
 
-    # 尝试用凭证请求一下，验证是否过期
-    try:
-        my_info = await user.User(
-            uid=int(cred.dedeuserid), credential=cred
-        ).get_user_info()
-        return json.dumps({
-            "logged_in": True,
-            "uid": cred.dedeuserid,
-            "username": my_info.get("name", ""),
-            "message": "凭证有效",
-        }, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({
-            "logged_in": False,
-            "message": f"凭证可能已过期: {str(e)}，请重新调用 bili_login 登录",
-        }, ensure_ascii=False)
+    credential = credential_result.credential
+    my_info = credential_result.user_info or {}
+    return json.dumps({
+        "logged_in": True,
+        "credential_status": CredentialStatus.VALID.value,
+        "uid": credential.dedeuserid,
+        "username": my_info.get("name", ""),
+        "message": "凭证有效",
+    }, ensure_ascii=False)
 
 
 # ========== Tool 1: 搜索视频 ==========
@@ -286,7 +426,7 @@ async def bili_comments(bvid: str, num: int = 30) -> str:
     Returns:
         JSON格式的评论列表，包含用户名、评论内容、点赞数、回复数
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
@@ -350,7 +490,7 @@ async def bili_subtitle(bvid: str) -> str:
     Returns:
         视频的完整字幕文本
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
     info = await v.get_info()
@@ -412,7 +552,7 @@ async def bili_danmaku(bvid: str, num: int = 100) -> str:
     Returns:
         弹幕列表，包含弹幕文本和出现时间
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
 
     danmakus = await v.get_danmakus(page_index=0)
@@ -439,7 +579,7 @@ async def bili_video_info(bvid: str) -> str:
     Returns:
         视频标题、描述、UP主、播放量、评论数、收藏数等详细数据
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     stat = info.get("stat", {})
@@ -481,7 +621,7 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
     Returns:
         发表结果
     """
-    cred = get_cred()
+    cred = await get_cred()
     v = video.Video(bvid=bvid, credential=cred)
     info = await v.get_info()
     aid = info["aid"]
@@ -530,7 +670,7 @@ async def bili_crawl(keyword: str, max_videos: int = 5, comments_per_video: int 
     Returns:
         包含视频信息、评论和字幕的完整采集数据
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     # 搜索
     search_result = await search.search_by_type(
@@ -620,6 +760,123 @@ def _extract_cover_from_video(video_path: str) -> Picture:
     raise RuntimeError(f"无法从视频截取封面: {video_path}")
 
 
+# ========== 辅助：合集（season） ==========
+# 投稿接口（x/vu/web/add/v3）不收合集字段，合集归属是投稿之后单独改的。
+# 而且真正能用的是「小节」（section）：新版合集下必有一个默认小节，
+# 添加视频走 section/episodes/add，要的是 section_id（不是 season_id）+ 视频的 aid/cid。
+# 「上传时加进合集」= 传完拿到 aid → 查该合集的第一个 section → 把 aid/cid 加进去。
+
+SEASON_LIST_API = "https://member.bilibili.com/x2/creative/web/seasons"
+SEASON_SECTION_API = "https://member.bilibili.com/x2/creative/web/season/section"
+SECTION_ADD_API = "https://member.bilibili.com/x2/creative/web/season/section/episodes/add"
+SECTION_DEL_API = "https://member.bilibili.com/x2/creative/web/season/section/episode/del"
+VIDEO_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
+
+
+def _member_api(url: str, method: str, cred: Credential, data: dict | None = None,
+                params: dict | None = None, json_body: bool = True):
+    """member.bilibili.com 的写接口统一走这里：csrf 在 query，JSON 体里也带一份。
+
+    episode/del 这类老接口要表单体，传 json_body=False。
+    """
+    from bilibili_api.utils.network import Api
+
+    api = Api(url=url, method=method, credential=cred, no_csrf=True,
+              json_body=json_body and data is not None, verify=True)
+    api.update_params(**(params or {"csrf": cred.bili_jct}))
+    if data is not None:
+        api.update_data(**data)
+    return api
+
+
+async def _view_meta(cred: Credential | None = None, bvid: str = "", aid: int = 0) -> dict:
+    """拿稿件的 aid / title / cid。
+
+    带上凭据再请求：裸请求会被 B 站 412 风控拦掉（公开接口也一样）。
+    """
+    from bilibili_api.utils.network import Api
+
+    params = {"bvid": bvid} if bvid else {"aid": int(aid)}
+    api = Api(url=VIDEO_VIEW_API, method="GET", credential=cred) if cred else \
+        Api(url=VIDEO_VIEW_API, method="GET")
+    data = await api.update_params(**params).result
+    return data if isinstance(data, dict) else {}
+
+
+async def _season_sections(cred: Credential, season_id: int = 0) -> list[dict]:
+    """我的合集（含每个合集的 section）；给 season_id 就只返回那一个合集的。"""
+    from bilibili_api.utils.network import Api
+
+    data = await Api(url=SEASON_LIST_API, method="GET", credential=cred, verify=True).update_params(
+        pn=1, ps=100, order="ctime", sort="desc").result
+    out = []
+    for item in (data or {}).get("seasons") or []:
+        season = item.get("season") or {}
+        if season_id and int(season.get("id") or 0) != int(season_id):
+            continue
+        for s in ((item.get("sections") or {}).get("sections") or []):
+            out.append({
+                "season_id": season.get("id"),
+                "season_title": season.get("title"),
+                "section_id": s.get("id"),
+                "section_title": s.get("title"),
+            })
+    return out
+
+
+async def _season_add(cred: Credential, section_id: int, aid: int, cid: int, title: str) -> dict:
+    """把一条视频加进合集小节。已经在里面（20080）按成功处理，重复调用是幂等的。"""
+    api = _member_api(SECTION_ADD_API, "POST", cred, data={
+        "sectionId": int(section_id),
+        "episodes": [{"aid": int(aid), "cid": int(cid), "title": title, "charging_pay": 0}],
+        "csrf": cred.bili_jct,
+    })
+    try:
+        return await api.result
+    except Exception as e:                                    # noqa: BLE001
+        if "20080" in str(e):                                 # 当前稿件已存在在合集中
+            return {"already_in_season": True}
+        raise
+
+
+async def _season_episode_id(cred: Credential, section_id: int, aid: int) -> int | None:
+    """视频在合集里的 episode_id（移除时要用它，不是 aid）。"""
+    from bilibili_api.utils.network import Api
+
+    data = await Api(url=SEASON_SECTION_API, method="GET", credential=cred, verify=True).update_params(
+        id=int(section_id)).result
+    for ep in (data or {}).get("episodes") or []:
+        if int(ep.get("aid") or 0) == int(aid):
+            return int(ep.get("id") or 0) or None
+    return None
+
+
+async def _attach_season(cred: Credential, aid: int | None, season_id: int, title: str) -> dict:
+    """上传成功后挂合集。挂失败只回报，不回滚已经传好的稿件。"""
+    if not season_id:
+        return {}
+    if not aid:
+        return {"success": False, "season_id": int(season_id),
+                "error": "投稿结果里没有 aid，未能挂合集"}
+    try:
+        sections = await _season_sections(cred, int(season_id))
+        if not sections:
+            return {"success": False, "season_id": int(season_id),
+                    "error": f"合集 {season_id} 下没有小节（section），加不进去"}
+        section = sections[0]
+        info = await _view_meta(cred, aid=int(aid))
+        cid = ((info.get("pages") or [{}])[0]).get("cid")
+        if not cid:
+            return {"success": False, "season_id": int(season_id), "error": "拿不到视频 cid"}
+        await _season_add(cred, section["section_id"], int(aid),
+                          int(cid), (info.get("title") or title or "")[:80])
+        return {"success": True, "season_id": int(season_id),
+                "section_id": section["section_id"],
+                "season_title": section.get("season_title")}
+    except Exception as e:                                    # noqa: BLE001
+        return {"success": False, "season_id": int(season_id), "error": redact(str(e))}
+
+
 
 
 @mcp.tool()
@@ -644,7 +901,7 @@ async def bili_send_dynamic(
     if not text or not text.strip():
         return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
 
-    cred = get_cred()
+    cred = await get_cred()
 
     dyn = dynamic.BuildDynamic.empty()
     dyn.add_plain_text(text.strip())
@@ -684,6 +941,28 @@ async def bili_send_dynamic(
 
 # ========== Tool 9: 上传视频 ==========
 
+def _current_tids() -> dict:
+    """bilibili_api 自带的当前分区表 {子分区ID: "主分区 → 子分区"}；旧分区 ID 不在其中"""
+    import bilibili_api
+    path = Path(bilibili_api.__file__).parent / "data" / "video_uploader_meta_pre.json"
+    with open(path, encoding="utf-8") as f:
+        tid_list = json.load(f)["tid_list"]
+    return {c["id"]: f'{p["name"]} → {c["name"]}' for p in tid_list for c in p["children"]}
+
+
+class _MetaWithExtra(VideoMeta):
+    """在 VideoMeta 生成的投稿参数上追加库里没有的字段（cover43、creation_statement）"""
+
+    def __init__(self, extra: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.extra = extra
+
+    def __dict__(self) -> dict:
+        d = super().__dict__()
+        d.update(self.extra)
+        return d
+
+
 @mcp.tool()
 async def bili_upload_video(
     video_path: str,
@@ -695,6 +974,10 @@ async def bili_upload_video(
     source: str = "",
     dynamic_text: str = "",
     no_reprint: bool = True,
+    cover43_path: str = "",
+    publish_time: str = "",
+    ai_content: bool = False,
+    season_id: int = 0,
 ) -> str:
     """
     上传视频到B站
@@ -704,20 +987,40 @@ async def bili_upload_video(
         title: 视频标题（最多80字）
         desc: 视频简介描述
         tid: 分区ID，默认124（趣味科普人文-社科·法律·心理）。
-             常用分区：17=单机游戏 21=日常 95=数码 122=野生技术协会
-             124=社科 160=生活记录 171=电子竞技 183=影视杂谈
-             188=科技资讯 201=科学 207=财经商业 208=科技 209=手工
-             230=其他(生活) 231=美食 234=健身 32=完结动画
+             常用分区：231=科技·计算机技术 230=科技·软件应用 95=科技·数码
+             201=知识·科学科普 122=知识·野生技能协会 207=知识·财经商业
+             228=知识·人文历史 21=生活·日常 17=游戏·单机游戏 171=游戏·电子竞技
+             完整列表用 bili_video_zones 查询；已下线的分区 ID 会被拒绝
         tags: 标签，逗号分隔，如"AI,教程,编程"（至少1个标签）
         cover_path: 封面图片路径（可选，不填则B站自动截取）
         source: 转载来源URL（非原创时必填）
         dynamic_text: 粉丝动态文本（可选，投稿时同步发布的动态内容）
         no_reprint: 是否启用未经作者授权禁止转载，默认True
+        cover43_path: 4:3 封面图片路径（可选，用于首页等 4:3 位置）
+        publish_time: 定时发布时间，本机时区 "YYYY-MM-DD HH:MM"（可选，需距现在 2 小时~15 天；不填则立即发布）
+        ai_content: 创作声明"含AI生成内容"，默认False
+        season_id: 投稿后直接加入的合集 ID（0 = 不进合集）。用 bili_seasons 查自己的合集；
+                   投稿接口本身不收合集字段，这里是在传完之后立刻挂 season/switch，
+                   所以返回里会有 "season" 一项说明挂没挂上
 
     Returns:
         上传结果，包含BV号
     """
     # ---- 参数校验 ----
+    # 定时发布最先校验：时间写错时宁可不传，也不能变成立即发布
+    delay_time = None
+    if publish_time and publish_time.strip():
+        try:
+            delay_time = int(datetime.strptime(publish_time.strip(), "%Y-%m-%d %H:%M").timestamp())
+        except ValueError:
+            return json.dumps({"success": False, "error": "publish_time 格式应为 \"YYYY-MM-DD HH:MM\""}, ensure_ascii=False)
+        if not time.time() + 7200 <= delay_time <= time.time() + 15 * 86400:
+            return json.dumps({"success": False, "error": "publish_time 需距现在 2 小时~15 天"}, ensure_ascii=False)
+
+    # 已下线的分区 ID 会被B站默默放进"生活 → 日常"，提前拦下
+    if tid not in _current_tids():
+        return json.dumps({"success": False, "error": f"分区 {tid} 已不存在，请用当前分区 ID"}, ensure_ascii=False)
+
     if not video_path or not video_path.strip():
         return json.dumps({"success": False, "error": "video_path 不能为空，请提供视频文件的本地路径"}, ensure_ascii=False)
 
@@ -728,7 +1031,11 @@ async def bili_upload_video(
     if not title or not title.strip():
         return json.dumps({"success": False, "error": "title 不能为空"}, ensure_ascii=False)
 
-    cred = get_cred()
+    cover43_path = (cover43_path or "").strip()
+    if cover43_path and not os.path.isfile(cover43_path):
+        return json.dumps({"success": False, "error": f"4:3 封面文件不存在: {cover43_path}"}, ensure_ascii=False)
+
+    cred = await get_cred()
 
     try:
         # 准备分P
@@ -752,7 +1059,15 @@ async def bili_upload_video(
         else:
             cover_pic = _extract_cover_from_video(video_path)
 
-        meta = VideoMeta(
+        # VideoMeta 不支持的投稿字段：4:3 封面 URL、创作声明（id 1 = 含AI生成内容）
+        extra = {}
+        if cover43_path:
+            extra["cover43"] = await upload_cover(Picture.from_file(cover43_path), cred)
+        if ai_content:
+            extra["creation_statement"] = {"id": 1}
+
+        meta = _MetaWithExtra(
+            extra,
             tid=tid,
             title=title.strip()[:80],
             desc=desc or "",
@@ -762,6 +1077,7 @@ async def bili_upload_video(
             source=source.strip() if source and source.strip() else None,
             no_reprint=no_reprint if is_original else False,
             dynamic=dynamic_text.strip() if dynamic_text and dynamic_text.strip() else None,
+            delay_time=delay_time,
         )
 
         uploader = VideoUploader(
@@ -770,18 +1086,33 @@ async def bili_upload_video(
             credential=cred,
         )
 
-        # 上传事件回调（记录进度）
-        progress_info = {"phase": "初始化"}
+        # 上传事件回调：进度进 stderr（不占调用方上下文），失败时回报最后阶段
+        progress_info = {"phase": "init", "last": time.monotonic()}
 
         @uploader.on("__ALL__")
         async def on_event(data: dict):
-            progress_info["phase"] = str(data)
+            progress_info["phase"] = _event_label(data)
+            progress_info["last"] = time.monotonic()
+            print(f"[bili_upload] {progress_info['phase']}", file=sys.stderr, flush=True)
 
-        result = await uploader.start()
+        with _upload_tuning():
+            result = await _start_with_watchdog(uploader, progress_info)
+
+        # 合集：投稿接口不收合集字段。定时稿发布前 B 站也不让加（62003），交给 season_sync 补。
+        season_note = {}
+        if season_id:
+            submitted = result if isinstance(result, dict) else {}
+            if delay_time is None:
+                season_note = await _attach_season(cred, submitted.get("aid"), season_id, title.strip())
+            else:
+                season_note = {"success": True, "deferred": True,
+                               "note": "定时稿：B 站不让发布前加合集，发布后用 bili_season_sync 补挂"}
+
         return json.dumps({
             "success": True,
             "message": "视频上传成功",
             "data": result if isinstance(result, dict) else str(result),
+            **({"season": season_note} if season_note else {}),
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({
@@ -789,6 +1120,246 @@ async def bili_upload_video(
             "error": str(e),
             "last_phase": progress_info.get("phase", "unknown") if "progress_info" in dir() else "init",
         }, ensure_ascii=False)
+
+
+# ========== Tool: 查内容管理里的稿件（含定时发布、审核中） ==========
+
+@mcp.tool()
+async def bili_upload_manager_info(ps: int = 10, status: str = "all") -> str:
+    """
+    列出内容管理（稿件管理）里的稿件，含定时发布、审核中、未过审——公开视频接口看不到这些。
+
+    Args:
+        ps: 返回条数，默认 10
+        status: all=全部 / pubed=已发布 / not_pubed=未发布 / is_pubing=审核中
+
+    Returns:
+        JSON 列表：bvid、标题、状态、发布时间（本地时间）。定时投稿后用它核对是否已提交。
+    """
+    from bilibili_api import creative_center
+    from bilibili_api.creative_center import UploadManagerOrder, UploadManagerStatus
+
+    mapping = {"all": UploadManagerStatus.ALL, "pubed": UploadManagerStatus.PUBED,
+               "not_pubed": UploadManagerStatus.NOT_PUBED, "is_pubing": UploadManagerStatus.IS_PUBING}
+    if status not in mapping:
+        return json.dumps({"success": False, "error": f"status 只能是 {list(mapping)}"}, ensure_ascii=False)
+    cred = await get_cred()
+    limit = max(1, min(int(ps or 10), 50))
+
+    # status=all 实测会漏掉刚投的（审核中 / 定时待发布）稿件 —— 恰好是最该看到的那几条，
+    # 所以 all 改成三个状态分开查再按 bvid 去重合并。
+    if status == "all":
+        statuses = [UploadManagerStatus.IS_PUBING, UploadManagerStatus.NOT_PUBED,
+                    UploadManagerStatus.PUBED]
+    else:
+        statuses = [mapping[status]]
+
+    seen, items = set(), []
+    for st in statuses:
+        # 默认排序是「按播放量」，播放量低的稿件根本进不了前 N 条（系列里 #2~#5 就是这么丢的）。
+        # 按上传日期排才是我们要的「最近的稿件」。
+        data = await creative_center.get_video_upload_manager_info(
+            cred, ps=limit, status=st, order=UploadManagerOrder.SENDDATE)
+        for item in (data.get("arc_audits") or data.get("archives") or []):
+            arc = item.get("Archive") or item
+            key = arc.get("bvid") or id(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+
+    rows = []
+    for item in items:
+        arc = item.get("Archive") or item
+        audit = item.get("Audit") or {}
+        ptime, dtime = arc.get("ptime"), arc.get("dtime")
+        rows.append({
+            "bvid": arc.get("bvid"),
+            "title": arc.get("title"),
+            # 稿件状态在 Archive 上（例如「通过审核，等待发布」），Audit 不一定有
+            "state": arc.get("state_desc") or audit.get("state_desc") or arc.get("state") or audit.get("state"),
+            # dtime 才是定时发布时间；为空 = B 站会按立即发布处理
+            "ptime": time.strftime("%Y-%m-%d %H:%M", time.localtime(ptime)) if isinstance(ptime, (int, float)) and ptime else None,
+            "dtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(dtime)) if isinstance(dtime, (int, float)) and dtime else None,
+        })
+    return json.dumps({"success": True, "count": len(rows), "videos": rows}, ensure_ascii=False)
+
+
+# ========== Tool: 合集（season） ==========
+
+@mcp.tool()
+async def bili_seasons() -> str:
+    """
+    列出我自己的合集（新版合集 / season）和它下面的小节（section）。
+
+    投新稿把 season_id 传给 bili_upload_video 就会直接进合集；
+    给旧稿补挂用 bili_set_season。
+
+    Returns:
+        JSON 列表：season_id、合集标题、section_id、小节标题
+    """
+    cred = await get_cred()
+    rows = await _season_sections(cred)
+    return json.dumps({"success": True, "count": len(rows), "seasons": rows}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def bili_set_season(bvid: str = "", aid: int = 0, season_id: int = 0) -> str:
+    """
+    给已经投稿的视频挂进 / 移出合集（补挂旧稿用；新投稿直接用 bili_upload_video 的 season_id）。
+
+    Args:
+        bvid: 视频 BV 号（与 aid 二选一）
+        aid: 视频 aid（与 bvid 二选一）
+        season_id: 目标合集 ID；0 表示从它当前所在的合集移出
+
+    Returns:
+        操作结果（含 aid、合集/小节 ID、标题）
+    """
+    cred = await get_cred()
+    bvid = (bvid or "").strip()
+    if not aid and not bvid:
+        return json.dumps({"success": False, "error": "bvid 和 aid 至少给一个"}, ensure_ascii=False)
+
+    try:
+        info = await _view_meta(cred, bvid=bvid, aid=int(aid or 0))
+    except Exception as e:                                    # noqa: BLE001
+        msg = str(e)
+        # 公开 view 接口对「审核通过、等待发布」的定时稿就报 62003 —— 这时候连标题都查不到，
+        # 也就谈不上挂合集了，等它上线再说。
+        if "62003" in msg or "等待发布" in msg:
+            return json.dumps({"success": False, "bvid": bvid or None,
+                               "error": "这条稿件还没发布（B 站：审核通过、等待发布），"
+                                        "发布之后才能加合集；pipeline 的 season_sync 会自动补挂"},
+                              ensure_ascii=False)
+        return json.dumps({"success": False, "error": redact(msg)}, ensure_ascii=False)
+    real_aid = int(info.get("aid") or aid or 0)
+    if not real_aid:
+        return json.dumps({"success": False, "error": f"查不到稿件 {bvid or aid}"}, ensure_ascii=False)
+    title = (info.get("title") or "")[:80]
+
+    if season_id:
+        sections = await _season_sections(cred, int(season_id))
+        if not sections:
+            return json.dumps({"success": False, "error": f"合集 {season_id} 下没有小节（section）"},
+                              ensure_ascii=False)
+        section = sections[0]
+        cid = ((info.get("pages") or [{}])[0]).get("cid")
+        if not cid:
+            return json.dumps({"success": False, "error": "拿不到视频 cid"}, ensure_ascii=False)
+        try:
+            await _season_add(cred, section["section_id"], real_aid, int(cid), title)
+        except Exception as e:                                # noqa: BLE001
+            msg = str(e)
+            if "62003" in msg or "等待发布" in msg:
+                return json.dumps({"success": False, "aid": real_aid, "season_id": int(season_id),
+                                   "error": "B 站不让把「审核通过、等待发布」的定时稿加进合集；"
+                                            "等它按定时真正发布之后再挂（pipeline 的 season_sync 会自动补）"},
+                                  ensure_ascii=False)
+            return json.dumps({"success": False, "error": redact(msg), "aid": real_aid,
+                               "season_id": int(season_id)}, ensure_ascii=False)
+        return json.dumps({"success": True, "aid": real_aid, "season_id": int(season_id),
+                           "section_id": section["section_id"], "title": title,
+                           "message": f'已加入合集「{section.get("season_title")}」'}, ensure_ascii=False)
+
+    # season_id=0：从当前所在的合集里摘出去（episode/del 要的是 episode_id，不是 aid）
+    for s in await _season_sections(cred):
+        try:
+            ep_id = await _season_episode_id(cred, s["section_id"], real_aid)
+        except Exception:                                     # noqa: BLE001
+            continue
+        if not ep_id:
+            continue
+        try:
+            await _member_api(SECTION_DEL_API, "POST", cred,
+                              data={"id": ep_id, "csrf": cred.bili_jct}, json_body=False).result
+        except Exception as e:                                # noqa: BLE001
+            return json.dumps({"success": False, "error": redact(str(e)), "aid": real_aid},
+                              ensure_ascii=False)
+        return json.dumps({"success": True, "aid": real_aid, "removed_from": s.get("season_title"),
+                           "title": title, "message": "已移出合集"}, ensure_ascii=False)
+    return json.dumps({"success": True, "aid": real_aid, "title": title,
+                       "message": "这条稿件本来就不在任何合集里"}, ensure_ascii=False)
+
+
+async def _sync_season(cred: Credential, season_id: int, title_prefix: str = "",
+                       limit: int = 20, dry_run: bool = False) -> dict:
+    """把「已发布、但还没进合集」的稿件补进合集。season_sync.py 和工具都走这里。"""
+    from bilibili_api import user
+    from bilibili_api.user import VideoOrder
+    from bilibili_api.utils.network import Api
+
+    sections = await _season_sections(cred, int(season_id))
+    if not sections:
+        return {"success": False, "error": f"合集 {season_id} 下没有小节（section）"}
+    section = sections[0]
+
+    data = await Api(url=SEASON_SECTION_API, method="GET", credential=cred,
+                     verify=True).update_params(id=int(section["section_id"])).result
+    current = {int(ep.get("aid") or 0) for ep in (data or {}).get("episodes") or []}
+
+    uid = int(getattr(cred, "dedeuserid", 0) or 0)
+    if not uid:
+        return {"success": False, "error": "凭据里没有 uid"}
+    listing = await user.User(uid, credential=cred).get_videos(ps=max(1, min(int(limit), 50)), pn=1,
+                                              order=VideoOrder.PUBDATE)
+    vlist = ((listing or {}).get("list") or {}).get("vlist") or []
+
+    added, skipped, errors, already = [], [], [], 0
+    for v in vlist:
+        aid, title = int(v.get("aid") or 0), (v.get("title") or "")
+        if not aid or (title_prefix and not title.startswith(title_prefix)):
+            continue
+        if aid in current:
+            already += 1
+            continue
+        if dry_run:
+            skipped.append({"aid": aid, "bvid": v.get("bvid"), "title": title, "note": "dry-run"})
+            continue
+        try:
+            info = await _view_meta(cred, aid=aid)
+            cid = ((info.get("pages") or [{}])[0]).get("cid")
+            if not cid:
+                errors.append({"aid": aid, "title": title, "error": "拿不到 cid"})
+                continue
+            await _season_add(cred, section["section_id"], aid, int(cid), title[:80])
+            added.append({"aid": aid, "bvid": v.get("bvid"), "title": title})
+        except Exception as e:                                # noqa: BLE001
+            msg = str(e)
+            if "62003" in msg or "等待发布" in msg:
+                skipped.append({"aid": aid, "title": title, "note": "未发布，等它上线"})
+            else:
+                errors.append({"aid": aid, "title": title, "error": msg[:200]})
+
+    return {"success": True, "season_id": int(season_id),
+            "season_title": section.get("season_title"), "section_id": section["section_id"],
+            "already": already, "added": added, "skipped": skipped, "errors": errors}
+
+
+@mcp.tool()
+async def bili_season_sync(season_id: int = 0, title_prefix: str = "", limit: int = 20,
+                           dry_run: bool = False) -> str:
+    """
+    把「已经发布、但还没进合集」的稿件补进合集。
+
+    为什么要补：B 站不让把「审核通过、等待发布」的定时稿加进合集（62003），
+    所以投稿当时挂不上，得等它按定时真正发布之后再挂。重复调用是幂等的。
+
+    Args:
+        season_id: 合集 ID（0 = 用 config 里记的那一个）
+        title_prefix: 只补标题以它开头的稿件，留空表示不限
+        limit: 检查最近多少个已发布稿件，默认 20
+        dry_run: 只列出会补哪些，不真的动手
+
+    Returns:
+        JSON：already（已在合集）、added（本次补上）、skipped（含未发布的）、errors
+    """
+    cred = await get_cred()
+    try:
+        return json.dumps(await _sync_season(cred, int(season_id or 0), title_prefix,
+                                             limit, dry_run), ensure_ascii=False)
+    except Exception as e:                                    # noqa: BLE001
+        return json.dumps({"success": False, "error": redact(str(e))}, ensure_ascii=False)
 
 
 # ========== Tool 10: 上传多P视频 ==========
@@ -803,6 +1374,7 @@ async def bili_upload_video_multi(
     tags: str = "AI",
     cover_path: str = "",
     source: str = "",
+    season_id: int = 0,
 ) -> str:
     """
     上传多P视频到B站（多个分P合并为一个投稿）
@@ -816,11 +1388,12 @@ async def bili_upload_video_multi(
         tags: 标签，逗号分隔
         cover_path: 封面图片路径（可选）
         source: 转载来源URL（非原创时必填）
+        season_id: 投稿后直接加入的合集 ID（0 = 不进合集）
 
     Returns:
         上传结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     if not video_paths:
         return json.dumps({"success": False, "error": "video_paths 不能为空"}, ensure_ascii=False)
@@ -863,10 +1436,15 @@ async def bili_upload_video_multi(
         uploader = VideoUploader(pages=pages, meta=meta, credential=cred)
 
         result = await uploader.start()
+        season_note = {}
+        if season_id:
+            submitted = result if isinstance(result, dict) else {}
+            season_note = await _attach_season(cred, submitted.get("aid"), season_id, (title or "").strip())
         return json.dumps({
             "success": True,
             "message": f"多P视频上传成功（共{len(pages)}P）",
             "data": result if isinstance(result, dict) else str(result),
+            **({"season": season_note} if season_note else {}),
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
@@ -893,7 +1471,7 @@ async def bili_send_opus(
     Returns:
         发布结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     dyn = dynamic.BuildDynamic.empty()
 
@@ -932,40 +1510,16 @@ async def bili_send_opus(
 @mcp.tool()
 async def bili_video_zones() -> str:
     """
-    获取B站视频常用分区ID列表，供上传视频时选择tid参数
+    获取B站当前投稿分区ID列表（来自 bilibili_api 自带的分区表），供上传视频时选择tid参数
 
     Returns:
-        常用分区ID及名称
+        {主分区: {子分区ID: 子分区名}}
     """
-    zones = {
-        "科技": {
-            188: "科技资讯", 122: "野生技术协会", 95: "数码",
-            208: "科技", 209: "手工",
-        },
-        "知识": {
-            201: "科学", 124: "社科·法律·心理", 207: "财经商业",
-            228: "人文历史", 36: "科技(知识)",
-        },
-        "生活": {
-            21: "日常", 160: "生活记录", 230: "其他",
-            231: "美食", 234: "健身", 161: "搞笑",
-        },
-        "游戏": {
-            17: "单机游戏", 171: "电子竞技", 172: "手机游戏",
-            65: "网络游戏",
-        },
-        "影视": {
-            183: "影视杂谈", 138: "搞笑", 182: "影视剪辑",
-        },
-        "动画": {
-            32: "完结动画", 33: "连载动画", 51: "MAD·AMV",
-        },
-        "音乐": {
-            28: "原创音乐", 31: "翻唱", 59: "演奏",
-        },
-    }
+    zones = {}
+    for tid, name in _current_tids().items():
+        parent, child = name.split(" → ")
+        zones.setdefault(parent, {})[tid] = child
     return json.dumps(zones, ensure_ascii=False)
-
 
 # ========================================================================
 #                        V1.2 — 数据分析 & 互动运营
@@ -1109,7 +1663,7 @@ async def bili_user_info(uid: int) -> str:
     Returns:
         用户昵称、粉丝数、关注数、签名、等级、视频数等
     """
-    cred = get_cred()
+    cred = await get_cred()
     u = user.User(uid=uid, credential=cred)
     info = await u.get_user_info()
 
@@ -1159,7 +1713,7 @@ async def bili_user_videos(uid: int, pn: int = 1, ps: int = 30, order: str = "pu
     Returns:
         视频列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     u = user.User(uid=uid, credential=cred)
 
     order_map = {
@@ -1203,13 +1757,15 @@ async def bili_favorite_lists(uid: int = 0) -> str:
     Returns:
         收藏夹列表，包含ID、名称、视频数量
     """
-    cred = get_cred()
+    cred = await get_cred()
     if uid == 0:
-        # 从凭证获取自己的UID
-        import json as _json
-        with open(CRED_FILE) as f:
-            data = _json.load(f)
-        uid = int(data.get("dedeuserid", 0))
+        own_uid = str(cred.dedeuserid or "")
+        if not own_uid.isdigit() or int(own_uid) <= 0:
+            return json.dumps({
+                "success": False,
+                "error": "凭证有效，但未能取得当前用户 UID",
+            }, ensure_ascii=False)
+        uid = int(own_uid)
 
     result = await favorite_list.get_video_favorite_list(uid=uid, credential=cred)
     fav_lists = []
@@ -1238,7 +1794,7 @@ async def bili_favorite_content(media_id: int, page: int = 1, keyword: str = "")
     Returns:
         收藏夹内的视频列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     result = await favorite_list.get_video_favorite_list_content(
         media_id=media_id,
         page=page,
@@ -1279,7 +1835,7 @@ async def bili_send_message(receiver_uid: int, text: str) -> str:
     Returns:
         发送结果
     """
-    cred = get_cred()
+    cred = await get_cred()
 
     if not text or not text.strip():
         return json.dumps({"success": False, "error": "text 不能为空"}, ensure_ascii=False)
@@ -1310,7 +1866,7 @@ async def bili_unread_messages() -> str:
     Returns:
         各类未读消息数量
     """
-    cred = get_cred()
+    cred = await get_cred()
     try:
         result = await session.get_unread_messages(credential=cred)
         return json.dumps(result, ensure_ascii=False)
@@ -1328,7 +1884,7 @@ async def bili_received_replies() -> str:
     Returns:
         回复列表
     """
-    cred = get_cred()
+    cred = await get_cred()
     try:
         result = await session.get_replies(credential=cred)
         return json.dumps(result, ensure_ascii=False)
@@ -1346,7 +1902,7 @@ async def bili_received_at_and_likes() -> str:
     Returns:
         包含 at 和 likes 两部分的通知数据
     """
-    cred = get_cred()
+    cred = await get_cred()
     result = {}
     try:
         result["at"] = await session.get_at(credential=cred)

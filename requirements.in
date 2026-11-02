@@ -1,0 +1,4 @@
+bilibili-api-python==17.4.2
+aiohttp>=3.9,<4
+mcp>=1.0,<2
+cryptography>=44,<47
